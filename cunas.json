@@ -1,0 +1,9 @@
+{
+  "activo": true,
+  "intervalo_segundos": 60,
+  "bajar_musica_pct": 80,
+  "studio_auto": true,
+  "studio_orden": "Aleatorio",
+  "studio_duck": true,
+  "cunas": []
+}
