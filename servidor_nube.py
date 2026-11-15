@@ -223,14 +223,14 @@ def load_json_manifest(rel_path: str, default_val):
         p = base / rel_path.replace("/", os.sep)
         if p.exists():
             try:
-                return json.loads(p.read_text(encoding="utf-8"))
+                return json.loads(p.read_text(encoding="utf-8-sig"))
             except Exception:
                 pass
     try:
         url = f"https://mgbarcelonalive.github.io/{rel_path}?t={int(time.time())}"
         req = urllib.request.Request(url, headers={"User-Agent": "MG-Cloud-Server"})
         with urllib.request.urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            return json.loads(resp.read().decode("utf-8-sig"))
     except Exception:
         return default_val
 
@@ -266,8 +266,25 @@ class CloudRadioEngine:
             return local_candidates[-1]
         return "ffmpeg"
 
+    def _get_music_map(self) -> dict[str, Path]:
+        m = {}
+        extra_dirs = [
+            Path(r"H:\MUSICA\02-MUSICA STUDIO 54 ( The Best of 1994 -2020 )"),
+            Path(r"H:\MUSICA\01-MUSICA DJ MOISES GALLARDO"),
+            Path(r"H:\MUSICA\01-GLITTERBOK DISCO, HOUSE, SOUL, FUNKY"),
+            Path(r"H:\MUSICA\MUSICA MATINEÉ .Compilation"),
+            Path(r"H:\MUSICA\MUSICA DE IBIZA HOUSE.DEEP"),
+        ]
+        for ed in extra_dirs:
+            if ed.exists():
+                for f in sorted(ed.rglob("*.mp3")):
+                    m[f.name] = f
+        for f in sorted(MUSIC_DIR.rglob("*.mp3")):
+            m[f.name] = f
+        return m
+
     def list_music(self):
-        return [f.name for f in sorted(MUSIC_DIR.rglob("*.mp3"))]
+        return sorted(self._get_music_map().keys())
 
     def list_cunas(self):
         return [f.name for f in sorted(CUNAS_DIR.glob("*.mp3"))]
@@ -376,7 +393,7 @@ class CloudRadioEngine:
             self.forced_file = None
             return f
 
-        music_files = sorted(MUSIC_DIR.rglob("*.mp3"))
+        music_files = list(self._get_music_map().values())
         cuna_files = sorted(CUNAS_DIR.glob("*.mp3"))
 
         if self.cunas_enabled and cuna_files and (self.tracks_since_cuna >= self.cuna_every_n or not music_files):
@@ -408,44 +425,36 @@ class CloudRadioEngine:
                 continue
 
             self.skip_requested = False
-            cmd = [
-                self.ffmpeg_bin,
-                "-re",
-                "-i", str(next_file),
-                "-vn",
-                "-acodec", "libmp3lame",
-                "-ab", "128k",
-                "-ar", "44100",
-                "-ac", "2",
-                "-f", "mp3",
-                "pipe:1"
-            ]
             try:
-                proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                    bufsize=4096
-                )
-                while proc.poll() is None:
-                    if self.skip_requested or self.live_active:
-                        proc.terminate()
-                        break
-                    chunk = proc.stdout.read(4096)
-                    if not chunk:
-                        break
-                    self.broadcast_chunk(chunk)
+                fsize = next_file.stat().st_size
+                with open(next_file, "rb") as fp:
+                    # Saltar cabecera ID3v2 si existe para enviar frames MP3 limpios a Icecast
+                    head = fp.read(10)
+                    if len(head) == 10 and head[:3] == b"ID3":
+                        id3_size = (
+                            ((head[6] & 0x7F) << 21)
+                            | ((head[7] & 0x7F) << 14)
+                            | ((head[8] & 0x7F) << 7)
+                            | (head[9] & 0x7F)
+                        )
+                        fp.seek(10 + id3_size)
+                    else:
+                        fp.seek(0)
+
+                    # Calcular ritmo de envío (~24 KB/s para 192 kbps o ~16 KB/s para 128 kbps)
+                    # Estimamos bitrate a partir del tamaño o usamos 20 KB/s con buffer de Icecast
+                    chunk_size = 4096
+                    while not self.skip_requested and not self.live_active:
+                        t0 = time.time()
+                        chunk = fp.read(chunk_size)
+                        if not chunk:
+                            break
+                        self.broadcast_chunk(chunk)
+                        elapsed = time.time() - t0
+                        sleep_s = max(0.02, 0.16 - elapsed)
+                        time.sleep(sleep_s)
             except Exception:
-                try:
-                    with open(next_file, "rb") as fp:
-                        while not self.skip_requested and not self.live_active:
-                            chunk = fp.read(4096)
-                            if not chunk:
-                                break
-                            self.broadcast_chunk(chunk)
-                            time.sleep(0.24)
-                except Exception:
-                    time.sleep(1.0)
+                time.sleep(1.0)
 
 
 ENGINE = CloudRadioEngine()
@@ -1180,9 +1189,12 @@ class RadioHTTPHandler(BaseHTTPRequestHandler):
         if path == "/api/play_track":
             length = int(self.headers.get("Content-Length", "0"))
             body = json.loads(self.rfile.read(length).decode("utf-8"))
-            folder = CUNAS_DIR if body.get("folder") == "cunas" else MUSIC_DIR
-            target = folder / Path(body.get("name", "")).name
-            if target.exists():
+            req_name = Path(body.get("name", "")).name
+            if body.get("folder") == "cunas":
+                target = CUNAS_DIR / req_name
+            else:
+                target = ENGINE._get_music_map().get(req_name, MUSIC_DIR / req_name)
+            if target and target.exists():
                 ENGINE.forced_file = str(target)
                 ENGINE.current_title = target.stem.replace("_", " ")
                 ENGINE.skip_requested = True
