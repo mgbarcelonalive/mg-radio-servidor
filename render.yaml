@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: mg-barcelona-live-radio
+    runtime: docker
+    plan: free
+    envVars:
+      - key: PORT
+        value: 7860
+      - key: MG_ADMIN_PASS
+        value: mg2026
