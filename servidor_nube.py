@@ -79,6 +79,66 @@ PLANTILLAS_DISPONIBLES = [
     ("navidad", "🎄 Navidad"),
 ]
 
+# 16 ESTILOS / TIPOS DE MÚSICA AUTOMATIZADA + MODO AUTO-MIX
+GENRES_CATALOG = [
+    ("todas", "🔄 Auto-Mix (Todos los Estilos)", []),
+    ("house", "🎧 House", [
+        r"H:\MUSICA\MUSICA HOUSE",
+        r"H:\MUSICA\HOUSE -VARIOS TEMAS  MP3-October-2020",
+        r"H:\MUSICA\01-MUSICA DJ MOISES GALLARDO",
+    ]),
+    ("tecno", "⚡ Techno", [
+        r"H:\MUSICA\MUSICA Techno",
+    ]),
+    ("funky", "🕺 Funky", [
+        r"H:\MUSICA\01-MUSICA FUNKY HOUSE 2022",
+        r"H:\MUSICA\00-MUSICA RETRO DISCO HOUSE 2021",
+    ]),
+    ("groove", "🎷 Groove", [
+        r"H:\MUSICA\03-MUSICA DISCO FUNK. SOUL Y GROOVES",
+        r"H:\MUSICA\MUSICA  HOUSE,GROOVE, MAYO 2021",
+    ]),
+    ("ibiza", "🌅 Ibiza", [
+        r"H:\MUSICA\MUSICA DE IBIZA HOUSE.DEEP",
+    ]),
+    ("acid house", "🧪 Acid House", [
+        r"H:\MUSICA\MUSICA DANCE Y ACID HOUSE",
+    ]),
+    ("club houses", "🏛️ Club Houses", [
+        r"H:\MUSICA\MUSICA CLUB HOUSE",
+    ]),
+    ("beatport", "🔥 Beatport", [
+        r"H:\MUSICA\MUSICA BEATPORT TOP 100",
+    ]),
+    ("deep house", "🌊 Deep House", [
+        r"H:\MUSICA\MUSICA DEEP HOUSE",
+    ]),
+    ("matinne", "☀️ Matinée", [
+        r"H:\MUSICA\MUSICA MATINEÉ .Compilation",
+    ]),
+    ("ministry", "👑 Ministry", [
+        r"H:\MUSICA\MUSICA MINISTRY.OF.SOUNDS",
+    ]),
+    ("house clasic", "🪩 House Classic & Studio 54", [
+        r"H:\MUSICA\MUSICA HOUSE CLASSICS",
+        r"H:\MUSICA\02-MUSICA STUDIO 54 ( The Best of 1994 -2020 )",
+        r"H:\MUSICA\MUSICA DE DISCOTECA 1989-2013",
+    ]),
+    ("reggaeton", "🌴 Reggaeton", [
+        r"H:\MUSICA\MUSICA REGGAETON ACTUAL",
+    ]),
+    ("tech houses", "🔊 Tech Houses", [
+        r"H:\MUSICA\MUSICA TECH HOUSE",
+    ]),
+    ("houses underground", "🕶️ Houses Underground", [
+        r"H:\MUSICA\MUSICA HOUSE UNDERGROUND",
+    ]),
+    ("glitterbok disco", "✨ Glitterbok Disco", [
+        r"H:\MUSICA\01-GLITTERBOK DISCO, HOUSE, SOUL, FUNKY",
+        r"H:\MUSICA\MUSICA ELECTRONICA DISCO",
+    ]),
+]
+
 
 def add_log(msg: str):
     ts = time.strftime("%H:%M:%S")
@@ -256,6 +316,12 @@ class CloudRadioEngine:
         self.live_active = False
         self.ffmpeg_bin = self._find_ffmpeg()
         self.icecast_sock = None
+        self.active_genre = "todas"
+        self.genre_tracks = {}
+        self.all_tracks = {}
+        self.generated_queue = []
+        self.index_lock = threading.Lock()
+        self.rebuild_music_index()
 
     def _find_ffmpeg(self):
         p = shutil.which("ffmpeg")
@@ -266,25 +332,105 @@ class CloudRadioEngine:
             return local_candidates[-1]
         return "ffmpeg"
 
+    def rebuild_music_index(self):
+        """Indexa las 16 categorías musicales de H:\MUSICA y del servidor en memoria rápida."""
+        new_genre_tracks = {}
+        new_all_tracks = {}
+        for gid, glabel, gdirs in GENRES_CATALOG:
+            if gid == "todas":
+                continue
+            bucket = {}
+            # Carpetas del disco H:\MUSICA para este estilo
+            for d_str in gdirs:
+                dp = Path(d_str)
+                if dp.exists():
+                    for f in dp.rglob("*.mp3"):
+                        bucket[f.name] = f
+                        new_all_tracks[f.name] = f
+            # Subcarpeta en el servidor: musica/<gid>/
+            srv_sub = MUSIC_DIR / gid.replace(" ", "_")
+            srv_sub.mkdir(parents=True, exist_ok=True)
+            for f in srv_sub.rglob("*.mp3"):
+                bucket[f.name] = f
+                new_all_tracks[f.name] = f
+            new_genre_tracks[gid] = bucket
+
+        # Canciones sueltas en la raíz de musica/ se añaden a 'house' por defecto
+        for f in MUSIC_DIR.glob("*.mp3"):
+            new_genre_tracks.setdefault("house", {})[f.name] = f
+            new_all_tracks[f.name] = f
+
+        with self.index_lock:
+            self.genre_tracks = new_genre_tracks
+            self.all_tracks = new_all_tracks
+        self.generate_playlist_for_genre(self.active_genre)
+
+    def generate_playlist_for_genre(self, genre_id: str, limit: int = 80):
+        """Genera una lista automatizada inteligente para el estilo musical elegido."""
+        label_map = {gid: glabel for gid, glabel, _ in GENRES_CATALOG}
+        if genre_id not in label_map:
+            genre_id = "todas"
+        self.active_genre = genre_id
+
+        queue = []
+        with self.index_lock:
+            if genre_id == "todas":
+                # Mezcla equilibrada rotando por todos los estilos con música
+                available_genres = [gid for gid, _, _ in GENRES_CATALOG if gid != "todas" and self.genre_tracks.get(gid)]
+                if available_genres:
+                    per_genre_lists = {
+                        gid: random.sample(list(self.genre_tracks[gid].items()), min(len(self.genre_tracks[gid]), 15))
+                        for gid in available_genres
+                    }
+                    for i in range(15):
+                        random.shuffle(available_genres)
+                        for gid in available_genres:
+                            items = per_genre_lists[gid]
+                            if i < len(items):
+                                fname, fpath = items[i]
+                                queue.append({
+                                    "name": fname,
+                                    "path": str(fpath),
+                                    "genre": gid,
+                                    "genre_label": label_map.get(gid, gid),
+                                })
+                                if len(queue) >= limit:
+                                    break
+                        if len(queue) >= limit:
+                            break
+            else:
+                bucket = self.genre_tracks.get(genre_id, {})
+                items = list(bucket.items())
+                random.shuffle(items)
+                for fname, fpath in items[:limit]:
+                    queue.append({
+                        "name": fname,
+                        "path": str(fpath),
+                        "genre": genre_id,
+                        "genre_label": label_map.get(genre_id, genre_id),
+                    })
+
+        self.generated_queue = queue
+        add_log(f"Lista automatizada generada para «{label_map.get(genre_id, genre_id)}» ({len(queue)} temas en cola).")
+        return queue
+
     def _get_music_map(self) -> dict[str, Path]:
-        m = {}
-        extra_dirs = [
-            Path(r"H:\MUSICA\02-MUSICA STUDIO 54 ( The Best of 1994 -2020 )"),
-            Path(r"H:\MUSICA\01-MUSICA DJ MOISES GALLARDO"),
-            Path(r"H:\MUSICA\01-GLITTERBOK DISCO, HOUSE, SOUL, FUNKY"),
-            Path(r"H:\MUSICA\MUSICA MATINEÉ .Compilation"),
-            Path(r"H:\MUSICA\MUSICA DE IBIZA HOUSE.DEEP"),
-        ]
-        for ed in extra_dirs:
-            if ed.exists():
-                for f in sorted(ed.rglob("*.mp3")):
-                    m[f.name] = f
-        for f in sorted(MUSIC_DIR.rglob("*.mp3")):
-            m[f.name] = f
-        return m
+        with self.index_lock:
+            if self.active_genre != "todas" and self.genre_tracks.get(self.active_genre):
+                return dict(self.genre_tracks[self.active_genre])
+            return dict(self.all_tracks)
+
+    def get_genres_summary(self):
+        with self.index_lock:
+            total_all = len(self.all_tracks)
+            res = []
+            for gid, glabel, _ in GENRES_CATALOG:
+                cnt = total_all if gid == "todas" else len(self.genre_tracks.get(gid, {}))
+                res.append({"id": gid, "label": glabel, "count": cnt})
+            return res, total_all
 
     def list_music(self):
-        return sorted(self._get_music_map().keys())
+        return [item["name"] for item in self.generated_queue[:100]]
 
     def list_cunas(self):
         return [f.name for f in sorted(CUNAS_DIR.glob("*.mp3"))]
@@ -335,6 +481,14 @@ class CloudRadioEngine:
 
     def add_client(self, wfile):
         with self.clients_lock:
+            # Enviar pre-buffer inicial (~3-4 segundos de frames MP3 limpios) para arranque instantáneo sin cortes
+            prebuf = b"".join(getattr(self, "prebuffer_packets", []))
+            if prebuf:
+                try:
+                    wfile.write(prebuf)
+                    wfile.flush()
+                except Exception:
+                    return
             self.clients.add(wfile)
 
     def remove_client(self, wfile):
@@ -357,6 +511,9 @@ class CloudRadioEngine:
                 resp = s.recv(256)
                 if b"200 OK" in resp:
                     self.icecast_sock = s
+                    prebuf = b"".join(getattr(self, "prebuffer_packets", []))
+                    if prebuf:
+                        s.sendall(prebuf)
                 else:
                     s.close()
             except Exception:
@@ -375,6 +532,12 @@ class CloudRadioEngine:
     def broadcast_chunk(self, chunk: bytes):
         if not chunk:
             return
+        if not hasattr(self, "prebuffer_packets"):
+            self.prebuffer_packets = []
+        self.prebuffer_packets.append(chunk)
+        if len(self.prebuffer_packets) > 18:
+            del self.prebuffer_packets[0]
+
         self._send_to_local_icecast(chunk)
         dead = []
         with self.clients_lock:
@@ -393,24 +556,118 @@ class CloudRadioEngine:
             self.forced_file = None
             return f
 
-        music_files = list(self._get_music_map().values())
         cuna_files = sorted(CUNAS_DIR.glob("*.mp3"))
-
-        if self.cunas_enabled and cuna_files and (self.tracks_since_cuna >= self.cuna_every_n or not music_files):
+        if self.cunas_enabled and cuna_files and (self.tracks_since_cuna >= self.cuna_every_n or not self.all_tracks):
             self.tracks_since_cuna = 0
             chosen = random.choice(cuna_files)
             self.current_title = f"Cuña Oficial · {chosen.stem}"
             add_log(f"Reproduciendo cuña: {chosen.name}")
             return chosen
 
-        if music_files:
-            self.tracks_since_cuna += 1
-            chosen = random.choice(music_files)
-            self.current_title = chosen.stem.replace("_", " ")
-            add_log(f"Reproduciendo canción: {chosen.name}")
-            return chosen
+        if not self.generated_queue:
+            self.generate_playlist_for_genre(self.active_genre)
+
+        while self.generated_queue:
+            item = self.generated_queue.pop(0)
+            chosen = Path(item["path"])
+            if chosen.exists():
+                self.tracks_since_cuna += 1
+                g_label = item.get("genre_label", "AutoDJ")
+                self.current_title = f"{g_label} · {chosen.stem.replace('_', ' ')}"
+                add_log(f"[{g_label}] Reproduciendo: {chosen.name}")
+                return chosen
 
         return None
+
+    @staticmethod
+    def _iter_mp3_packets(raw_bytes: bytes, frames_per_packet: int = 8):
+        """
+        Extrae paquetes alineados a frames MP3 reales (128/192/256/320 kbps o VBR)
+        y devuelve (packet_bytes, packet_duration_seconds) con precisión exacta.
+        """
+        n = len(raw_bytes)
+        pos = 0
+        # Saltar todas las cabeceras ID3v2 al inicio
+        while pos + 10 <= n and raw_bytes[pos:pos + 3] == b"ID3":
+            id3_size = (
+                ((raw_bytes[pos + 6] & 0x7F) << 21)
+                | ((raw_bytes[pos + 7] & 0x7F) << 14)
+                | ((raw_bytes[pos + 8] & 0x7F) << 7)
+                | (raw_bytes[pos + 9] & 0x7F)
+            )
+            pos += 10 + id3_size
+
+        # Quitar ID3v1 final si existe
+        if n >= 128 and raw_bytes[n - 128:n - 125] == b"TAG":
+            n -= 128
+
+        br_v1_l3 = (0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0)
+        br_v2_l3 = (0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0)
+        sr_v1 = (44100, 48000, 32000, 0)
+        sr_v2 = (22050, 24000, 16000, 0)
+        sr_v25 = (11025, 12000, 8000, 0)
+
+        buf = bytearray()
+        dur_acc = 0.0
+        f_count = 0
+        first_frame = True
+
+        while pos + 4 <= n:
+            if raw_bytes[pos] != 0xFF or (raw_bytes[pos + 1] & 0xE0) != 0xE0:
+                nxt = raw_bytes.find(b"\xFF", pos + 1, n)
+                if nxt == -1:
+                    break
+                pos = nxt
+                continue
+
+            b1 = raw_bytes[pos + 1]
+            b2 = raw_bytes[pos + 2]
+            ver = (b1 >> 3) & 0x03
+            layer = (b1 >> 1) & 0x03
+            br_idx = (b2 >> 4) & 0x0F
+            sr_idx = (b2 >> 2) & 0x03
+            pad = (b2 >> 1) & 0x01
+
+            if ver == 1 or layer != 1 or br_idx in (0, 15) or sr_idx == 3:
+                pos += 1
+                continue
+
+            if ver == 3:  # MPEG-1 Layer III
+                kbps = br_v1_l3[br_idx]
+                sr = sr_v1[sr_idx]
+                samples = 1152
+                frame_len = (144000 * kbps) // sr + pad
+            else:  # MPEG-2 / 2.5 Layer III
+                kbps = br_v2_l3[br_idx]
+                sr = sr_v2[sr_idx] if ver == 2 else sr_v25[sr_idx]
+                samples = 576
+                frame_len = (72000 * kbps) // sr + pad
+
+            if frame_len < 24 or pos + frame_len > n:
+                pos += 1
+                continue
+
+            frame_slice = raw_bytes[pos:pos + frame_len]
+            pos += frame_len
+
+            # Ignorar cabecera VBR Xing/Info del primer frame para no meter silencios ni saltos
+            if first_frame:
+                first_frame = False
+                if b"Xing" in frame_slice or b"Info" in frame_slice or b"VBRI" in frame_slice:
+                    continue
+
+            buf.extend(frame_slice)
+            dur_acc += samples / float(sr)
+            f_count += 1
+
+            if f_count >= frames_per_packet:
+                yield bytes(buf), dur_acc
+                buf.clear()
+                dur_acc = 0.0
+                f_count = 0
+
+        if buf:
+            yield bytes(buf), max(dur_acc, 0.05)
 
     def autodj_loop(self):
         while True:
@@ -426,35 +683,24 @@ class CloudRadioEngine:
 
             self.skip_requested = False
             try:
-                fsize = next_file.stat().st_size
-                with open(next_file, "rb") as fp:
-                    # Saltar cabecera ID3v2 si existe para enviar frames MP3 limpios a Icecast
-                    head = fp.read(10)
-                    if len(head) == 10 and head[:3] == b"ID3":
-                        id3_size = (
-                            ((head[6] & 0x7F) << 21)
-                            | ((head[7] & 0x7F) << 14)
-                            | ((head[8] & 0x7F) << 7)
-                            | (head[9] & 0x7F)
-                        )
-                        fp.seek(10 + id3_size)
-                    else:
-                        fp.seek(0)
+                raw_bytes = next_file.read_bytes()
+                t_start = time.perf_counter()
+                audio_sent_sec = 0.0
 
-                    # Calcular ritmo de envío (~24 KB/s para 192 kbps o ~16 KB/s para 128 kbps)
-                    # Estimamos bitrate a partir del tamaño o usamos 20 KB/s con buffer de Icecast
-                    chunk_size = 4096
-                    while not self.skip_requested and not self.live_active:
-                        t0 = time.time()
-                        chunk = fp.read(chunk_size)
-                        if not chunk:
-                            break
-                        self.broadcast_chunk(chunk)
-                        elapsed = time.time() - t0
-                        sleep_s = max(0.02, 0.16 - elapsed)
-                        time.sleep(sleep_s)
-            except Exception:
-                time.sleep(1.0)
+                for packet_bytes, packet_dur in self._iter_mp3_packets(raw_bytes, frames_per_packet=8):
+                    if self.skip_requested or self.live_active:
+                        break
+                    self.broadcast_chunk(packet_bytes)
+                    audio_sent_sec += packet_dur
+                    # Mantener un colchón constante de 0.8s por delante del reloj real para 0 cortes
+                    target_elapsed = audio_sent_sec - 0.8
+                    actual_elapsed = time.perf_counter() - t_start
+                    wait_sec = target_elapsed - actual_elapsed
+                    if wait_sec > 0.005:
+                        time.sleep(wait_sec)
+            except Exception as e:
+                add_log(f"Aviso reproductor: {e}")
+                time.sleep(0.5)
 
 
 ENGINE = CloudRadioEngine()
@@ -566,10 +812,12 @@ PANEL_HTML = """<!DOCTYPE html>
       <div class="card">
         <h2>📡 Emisión 24/7 desde el Servidor</h2>
         <div class="stat-row"><span>Sonando ahora:</span><strong id="nowPlaying" style="color:var(--cyan);">Cargando...</strong></div>
-        <div class="stat-row"><span>Modo:</span><strong>AutoDJ Servidor 24/7 (Sin Virtual DJ)</strong></div>
+        <div class="stat-row"><span>Estilo Activo:</span><strong id="activeGenreLabel" style="color:var(--gold);">🔄 Auto-Mix (Todos los Estilos)</strong></div>
+        <div class="stat-row"><span>Total Biblioteca en Disco:</span><strong id="totalLibraryCount" style="color:var(--cyan);">0 temas</strong></div>
         <div class="stat-row"><span>Oyentes conectados:</span><strong id="listenersCount" style="color:var(--gold);">0</strong></div>
         <div style="margin-top:0.9rem;display:flex;gap:0.55rem;flex-wrap:wrap;">
           <button class="btn btn-primary" onclick="skipTrack()">⏭ Siguiente Canción</button>
+          <button class="btn btn-gold" onclick="regenerateCurrentGenre()">🎲 Generar Nueva Lista de este Estilo</button>
           <a class="btn" href="/stream" target="_blank">🔗 Abrir Stream Directo</a>
         </div>
         <audio controls preload="none" src="/stream"></audio>
@@ -580,9 +828,25 @@ PANEL_HTML = """<!DOCTYPE html>
       <!-- SUBIR CARPETAS ENTERAS DE MÚSICA O ARCHIVOS SUELTOS -->
       <div class="card">
         <h2>📁 Subir Carpetas Llenas de Música o Archivos MP3</h2>
-        <p style="font-size:0.8rem;color:rgba(255,255,255,0.68);margin-bottom:0.75rem;">
-          Puedes elegir una <b>carpeta entera de tu disco</b> (subirá todos los MP3 de dentro automáticamente) o seleccionar canciones sueltas:
-        </p>
+        <label style="font-size:0.8rem;display:block;margin-bottom:0.3rem;color:var(--gold);">🎛️ Guardar en el Estilo / Tipo de Música:</label>
+        <select id="uploadGenreSelect">
+          <option value="house">🎧 House</option>
+          <option value="tecno">⚡ Techno</option>
+          <option value="funky">🕺 Funky</option>
+          <option value="groove">🎷 Groove</option>
+          <option value="ibiza">🌅 Ibiza</option>
+          <option value="acid house">🧪 Acid House</option>
+          <option value="club houses">🏛️ Club Houses</option>
+          <option value="beatport">🔥 Beatport</option>
+          <option value="deep house">🌊 Deep House</option>
+          <option value="matinne">☀️ Matinée</option>
+          <option value="ministry">👑 Ministry</option>
+          <option value="house clasic">🪩 House Classic & Studio 54</option>
+          <option value="reggaeton">🌴 Reggaeton</option>
+          <option value="tech houses">🔊 Tech Houses</option>
+          <option value="houses underground">🕶️ Houses Underground</option>
+          <option value="glitterbok disco">✨ Glitterbok Disco</option>
+        </select>
         <div style="margin-bottom:0.85rem;padding:0.8rem;border-radius:12px;border:1px dashed var(--cyan);background:rgba(0,240,255,0.04);">
           <label style="font-size:0.82rem;font-weight:700;color:var(--cyan);display:block;margin-bottom:0.4rem;">📁 Opción A: Subir Carpeta Entera de Música</label>
           <input type="file" id="folderInput" webkitdirectory directory multiple onchange="uploadMusicBatch(this.files)">
@@ -595,8 +859,17 @@ PANEL_HTML = """<!DOCTYPE html>
         <p id="uploadStatus" style="font-size:0.82rem;margin-top:0.65rem;color:var(--gold);"></p>
       </div>
 
+      <!-- SELECTOR DE LOS 16 ESTILOS MUSICALES AUTOMATIZADOS -->
       <div class="card" style="grid-column: 1 / -1;">
-        <h2>🎵 Biblioteca de Canciones en el Servidor (<span id="musicCount">0</span> temas)</h2>
+        <h2>🎛️ Generar Lista Automatizada por Tipo de Música (Pulsa un Estilo para Emitirlo)</h2>
+        <p style="font-size:0.82rem;color:rgba(255,255,255,0.7);margin-bottom:0.6rem;">
+          Selecciona cualquiera de los <b>16 estilos musicales</b> (o <b>Auto-Mix</b>) para que el servidor genere automáticamente una lista de ese género y la emita en directo:
+        </p>
+        <div class="tpl-grid" id="genreGrid"></div>
+      </div>
+
+      <div class="card" style="grid-column: 1 / -1;">
+        <h2>🎵 Cola Automatizada Generada (<span id="musicCount">0</span> temas listos en cola)</h2>
         <div class="track-list" id="musicList"></div>
       </div>
     </div>
@@ -811,15 +1084,32 @@ function setMsg(text) {
   document.getElementById('globalMsg').textContent = text;
 }
 
+let CURRENT_GENRE = 'todas';
+
 async function refreshStatus() {
   try {
     const r = await fetch('/api/status');
     const d = await r.json();
     document.getElementById('nowPlaying').textContent = d.current_title || 'Sin pista';
     document.getElementById('listenersCount').textContent = d.listeners;
-    document.getElementById('musicCount').textContent = d.music.length;
+    document.getElementById('musicCount').textContent = (d.playlist_queue || d.music || []).length;
+    document.getElementById('totalLibraryCount').textContent = `${d.total_library || 0} canciones indexadas en 16 estilos`;
     document.getElementById('cunasCount').textContent = d.cunas.length;
     document.getElementById('currentTplLabel').textContent = d.current_template || 'principal';
+    CURRENT_GENRE = d.active_genre || 'todas';
+
+    if (d.genres) {
+      const activeObj = d.genres.find(g => g.id === CURRENT_GENRE);
+      if (activeObj) {
+        document.getElementById('activeGenreLabel').textContent = `${activeObj.label} (${activeObj.count} temas)`;
+      }
+      document.getElementById('genreGrid').innerHTML = d.genres.map(g =>
+        `<button class="tpl-btn ${g.id === CURRENT_GENRE ? 'active' : ''}" onclick="setMusicGenre('${g.id}')">
+           <div>${g.label}</div>
+           <div style="font-size:0.72rem;color:var(--gold);margin-top:0.2rem;">${g.count} canciones</div>
+         </button>`
+      ).join('');
+    }
 
     if (d.specs) {
       document.getElementById('specCpu').textContent = `${d.specs.cpu_cores} Núcleos vCPU dedicados`;
@@ -834,9 +1124,15 @@ async function refreshStatus() {
       document.getElementById('serverLogsBox').innerHTML = d.logs.slice().reverse().map(l => `<div>${l}</div>`).join('');
     }
 
-    document.getElementById('musicList').innerHTML = d.music.length ? d.music.map(m =>
-      `<div class="track-item"><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">🎵 ${m}</span><button class="btn" style="padding:0.25rem 0.6rem;font-size:0.75rem;" onclick="playSpecific('musica', '${m.replace(/'/g,"\\'")}')">▶ Poner</button></div>`
-    ).join('') : '<p style="font-size:0.8rem;color:rgba(255,255,255,0.4);padding:0.5rem;">Usa los botones de arriba para subir carpetas enteras de música.</p>';
+    const qItems = d.playlist_queue || [];
+    document.getElementById('musicList').innerHTML = qItems.length ? qItems.map((item, idx) =>
+      `<div class="track-item">
+         <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+           <strong style="color:var(--gold);font-size:0.74rem;">[${item.genre_label || 'AutoDJ'}]</strong> 🎵 ${idx+1}. ${item.name}
+         </span>
+         <button class="btn" style="padding:0.25rem 0.6rem;font-size:0.75rem;" onclick="playSpecific('musica', '${item.name.replace(/'/g,"\\'")}')">▶ Poner</button>
+       </div>`
+    ).join('') : '<p style="font-size:0.8rem;color:rgba(255,255,255,0.4);padding:0.5rem;">Selecciona un estilo arriba para generar una lista automatizada.</p>';
 
     document.getElementById('cunasList').innerHTML = d.cunas.map(c =>
       `<div class="track-item"><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">🔊 ${c}</span><button class="btn" style="padding:0.25rem 0.6rem;font-size:0.75rem;" onclick="playSpecific('cunas', '${c.replace(/'/g,"\\'")}')">🔊 Lanzar</button></div>`
@@ -889,6 +1185,22 @@ async function refreshStatus() {
   } catch (e) {}
 }
 
+async function setMusicGenre(genreId, skipNow = true) {
+  setMsg(`🎛️ Generando lista automatizada para el estilo: ${genreId.toUpperCase()}...`);
+  const r = await fetch('/api/set_genre', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Admin-Pass': SESSION_PASS },
+    body: JSON.stringify({ genre: genreId, skip_now: skipNow })
+  });
+  const res = await r.json();
+  setMsg(res.message || '✅ Lista por estilo generada');
+  setTimeout(refreshStatus, 350);
+}
+
+async function regenerateCurrentGenre() {
+  await setMusicGenre(CURRENT_GENRE, false);
+}
+
 async function skipTrack() {
   await fetch('/api/next', { method: 'POST' });
   setTimeout(refreshStatus, 400);
@@ -908,6 +1220,7 @@ async function uploadMusicBatch(fileList) {
   const status = document.getElementById('uploadStatus');
   const pWrap = document.getElementById('musicProgressWrap');
   const pBar = document.getElementById('musicProgressBar');
+  const genreSel = document.getElementById('uploadGenreSelect').value || 'house';
   if (!mp3s.length) {
     status.textContent = '⚠️ No se encontraron archivos .mp3 en la selección.';
     return;
@@ -918,8 +1231,8 @@ async function uploadMusicBatch(fileList) {
     const f = mp3s[i];
     const pct = Math.round(((i + 1) / mp3s.length) * 100);
     pBar.style.width = pct + '%';
-    status.textContent = `Subiendo (${i+1}/${mp3s.length} · ${pct}%): ${f.name}...`;
-    const r = await fetch(`/api/upload?type=musica&name=${encodeURIComponent(f.name)}`, {
+    status.textContent = `Subiendo a [${genreSel}] (${i+1}/${mp3s.length} · ${pct}%): ${f.name}...`;
+    const r = await fetch(`/api/upload?type=musica&genre=${encodeURIComponent(genreSel)}&name=${encodeURIComponent(f.name)}`, {
       method: 'POST',
       headers: { 'X-Admin-Pass': SESSION_PASS },
       body: f
@@ -928,7 +1241,7 @@ async function uploadMusicBatch(fileList) {
     if (!res.ok) { status.textContent = res.message || 'Error'; return; }
     subidos++;
   }
-  status.textContent = `✅ ¡Carpeta subida! ${subidos} canciones MP3 añadidas al servidor.`;
+  status.textContent = `✅ ¡Carpeta subida al estilo "${genreSel}"! ${subidos} canciones MP3 añadidas.`;
   refreshStatus();
 }
 
@@ -1094,10 +1407,15 @@ class RadioHTTPHandler(BaseHTTPRequestHandler):
 
         if path == "/api/status":
             tpl_info = load_json_manifest("plantilla_live.json", {"plantilla": "principal"})
+            genres_list, total_lib = ENGINE.get_genres_summary()
             data = {
                 "current_title": ENGINE.current_title,
                 "live_active": ENGINE.live_active,
                 "listeners": len(ENGINE.clients),
+                "active_genre": ENGINE.active_genre,
+                "genres": genres_list,
+                "total_library": total_lib,
+                "playlist_queue": ENGINE.generated_queue[:80],
                 "music": ENGINE.list_music(),
                 "cunas": ENGINE.list_cunas(),
                 "current_template": tpl_info.get("plantilla", "principal"),
@@ -1174,6 +1492,22 @@ class RadioHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"ok": True})
             return
 
+        if path == "/api/set_genre":
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+            genre_id = body.get("genre", "todas")
+            skip_now = bool(body.get("skip_now", True))
+            q = ENGINE.generate_playlist_for_genre(genre_id)
+            if skip_now:
+                ENGINE.skip_requested = True
+            label_map = {gid: glabel for gid, glabel, _ in GENRES_CATALOG}
+            glabel = label_map.get(ENGINE.active_genre, ENGINE.active_genre)
+            self._send_json(200, {
+                "ok": True,
+                "message": f"✅ Lista automatizada generada para «{glabel}» ({len(q)} temas en cola)"
+            })
+            return
+
         if path == "/api/cuna_config":
             pw = self.headers.get("X-Admin-Pass", "")
             if pw != ADMIN_PASS:
@@ -1193,7 +1527,7 @@ class RadioHTTPHandler(BaseHTTPRequestHandler):
             if body.get("folder") == "cunas":
                 target = CUNAS_DIR / req_name
             else:
-                target = ENGINE._get_music_map().get(req_name, MUSIC_DIR / req_name)
+                target = ENGINE.all_tracks.get(req_name) or ENGINE._get_music_map().get(req_name, MUSIC_DIR / req_name)
             if target and target.exists():
                 ENGINE.forced_file = str(target)
                 ENGINE.current_title = target.stem.replace("_", " ")
@@ -1210,8 +1544,13 @@ class RadioHTTPHandler(BaseHTTPRequestHandler):
                 return
 
             up_type = qs.get("type", ["musica"])[0]
+            genre_id = unquote(qs.get("genre", ["house"])[0])
             fname = Path(unquote(qs.get("name", ["pista.mp3"])[0])).name
-            dest_dir = CUNAS_DIR if up_type == "cunas" else MUSIC_DIR
+            if up_type == "cunas":
+                dest_dir = CUNAS_DIR
+            else:
+                dest_dir = MUSIC_DIR / genre_id.replace(" ", "_")
+                dest_dir.mkdir(parents=True, exist_ok=True)
             length = int(self.headers.get("Content-Length", "0"))
             dest_path = dest_dir / fname
             remaining = length
@@ -1223,8 +1562,13 @@ class RadioHTTPHandler(BaseHTTPRequestHandler):
                     out.write(chunk)
                     remaining -= len(chunk)
 
-            add_log(f"Archivo de audio subido ({up_type}): {fname}")
-            self._send_json(200, {"ok": True, "message": f"✅ {fname} subido al servidor"})
+            if up_type != "cunas":
+                with ENGINE.index_lock:
+                    ENGINE.genre_tracks.setdefault(genre_id, {})[fname] = dest_path
+                    ENGINE.all_tracks[fname] = dest_path
+
+            add_log(f"Archivo de audio subido ({up_type}/{genre_id}): {fname}")
+            self._send_json(200, {"ok": True, "message": f"✅ {fname} subido al servidor ({genre_id})"})
             return
 
         if path == "/api/set_template":
